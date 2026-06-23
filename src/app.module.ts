@@ -4,6 +4,9 @@ import { AppEnvironment, getAppConfig } from './config/app.config';
 import { getDatabaseConfig } from './config/database.config';
 import { daos } from './common/dao';
 import { HealthModule } from './modules/health/health.module';
+import { ReportsModule } from './modules/reports/reports.module';
+import { StorageModule } from './modules/storage/storage.module';
+import { TelegramModule } from './modules/telegram/telegram.module';
 
 const appConfig = getAppConfig();
 const databaseConfig = getDatabaseConfig();
@@ -30,6 +33,9 @@ const databaseConfig = getDatabaseConfig();
       synchronize: false,
     }),
     HealthModule,
+    ReportsModule,
+    StorageModule,
+    TelegramModule,
   ],
 })
 export class AppModule {}
