@@ -6,6 +6,7 @@ type AdminReportMessageInput = {
   createdAt: Date;
   status: ReportStatus;
   photoCount: number;
+  completionPhotoCount?: number;
   author: {
     fullName: string;
     phone: string;
@@ -56,6 +57,7 @@ export const formatAdminReportMessage = (report: AdminReportMessageInput) => {
     report.description || '-',
     '',
     `Фото: ${report.photoCount} шт.`,
+    `Фото выполнения: ${report.completionPhotoCount || 0} шт.`,
     '',
     `Статус: ${getReportStatusLabel(report.status, 'ru')}`,
     report.assignedAdmin

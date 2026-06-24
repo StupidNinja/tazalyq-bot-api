@@ -22,6 +22,7 @@ export enum UserSessionState {
   WaitingConfirmation = 'WAITING_CONFIRMATION',
   WaitingRejectionReason = 'WAITING_REJECTION_REASON',
   WaitingAdminComment = 'WAITING_ADMIN_COMMENT',
+  WaitingCompletionPhotos = 'WAITING_COMPLETION_PHOTOS',
 }
 
 @Entity('user_sessions')

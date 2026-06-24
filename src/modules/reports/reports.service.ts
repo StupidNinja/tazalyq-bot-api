@@ -5,6 +5,7 @@ import { Repository } from 'typeorm';
 import {
   ReportDao,
   ReportPhotoDao,
+  ReportPhotoType,
   ReportStatusHistoryDao,
   UserDao,
 } from '../../common/dao';
@@ -22,6 +23,8 @@ type AddPhotoInput = {
   r2Url?: string | null;
   mimeType?: string | null;
   sizeBytes?: number | null;
+  photoType?: ReportPhotoType;
+  uploadedByUserId?: string | null;
 };
 
 type ListAdminReportsInput = {
@@ -69,9 +72,8 @@ export class ReportsService {
   }
 
   async addPhoto(input: AddPhotoInput) {
-    const photoCount = await this.photosRepository.count({
-      where: { reportId: input.reportId },
-    });
+    const photoType = input.photoType || ReportPhotoType.UserReport;
+    const photoCount = await this.countReportPhotos(input.reportId, photoType);
 
     if (photoCount >= 5) {
       throw new BadRequestException('Report photo limit exceeded');
@@ -80,6 +82,8 @@ export class ReportsService {
     return this.photosRepository.save(
       this.photosRepository.create({
         reportId: input.reportId,
+        photoType,
+        uploadedByUserId: input.uploadedByUserId || null,
         telegramFileId: input.telegramFileId,
         telegramFileUniqueId: input.telegramFileUniqueId,
         r2Bucket: input.r2Bucket,
@@ -153,6 +157,19 @@ export class ReportsService {
       throw new BadRequestException('Report not found');
     }
 
+    if (input.status === ReportStatus.Resolved) {
+      const completionPhotoCount = await this.countReportPhotos(
+        report.id,
+        ReportPhotoType.AdminCompletion,
+      );
+
+      if (completionPhotoCount < 1) {
+        throw new BadRequestException(
+          'Report requires at least one completion photo',
+        );
+      }
+    }
+
     await this.transitionStatus(
       report,
       input.status,
@@ -219,6 +236,40 @@ export class ReportsService {
       order: { submittedAt: 'DESC', createdAt: 'DESC' },
       take: 10,
       relations: { author: true, assignedAdmin: true },
+    });
+  }
+
+  async getReportUserPhotos(reportId: string) {
+    return this.getReportPhotos(reportId, ReportPhotoType.UserReport);
+  }
+
+  async getReportCompletionPhotos(reportId: string) {
+    return this.getReportPhotos(reportId, ReportPhotoType.AdminCompletion);
+  }
+
+  async countCompletionPhotos(reportId: string) {
+    return this.countReportPhotos(reportId, ReportPhotoType.AdminCompletion);
+  }
+
+  private async getReportPhotos(reportId: string, photoType: ReportPhotoType) {
+    return this.photosRepository.find({
+      where: {
+        reportId,
+        photoType,
+      },
+      order: { createdAt: 'ASC' },
+    });
+  }
+
+  private async countReportPhotos(
+    reportId: string,
+    photoType: ReportPhotoType,
+  ) {
+    return this.photosRepository.count({
+      where: {
+        reportId,
+        photoType,
+      },
     });
   }
 

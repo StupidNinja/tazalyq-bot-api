@@ -8,6 +8,12 @@ import {
 } from 'typeorm';
 
 import { ReportDao } from './report.dao';
+import { UserDao } from './user.dao';
+
+export enum ReportPhotoType {
+  UserReport = 'USER_REPORT',
+  AdminCompletion = 'ADMIN_COMPLETION',
+}
 
 @Entity('report_photos')
 export class ReportPhotoDao {
@@ -22,6 +28,21 @@ export class ReportPhotoDao {
   })
   @JoinColumn({ name: 'report_id' })
   report: ReportDao;
+
+  @Column({
+    name: 'photo_type',
+    type: 'enum',
+    enum: ReportPhotoType,
+    default: ReportPhotoType.UserReport,
+  })
+  photoType: ReportPhotoType;
+
+  @Column({ name: 'uploaded_by_user_id', type: 'uuid', nullable: true })
+  uploadedByUserId: string | null;
+
+  @ManyToOne(() => UserDao, { nullable: true, onDelete: 'SET NULL' })
+  @JoinColumn({ name: 'uploaded_by_user_id' })
+  uploadedByUser: UserDao | null;
 
   @Column({ name: 'telegram_file_id', type: 'varchar', length: 255 })
   telegramFileId: string;

@@ -9,6 +9,7 @@ import {
   UserRole,
   UserSessionDao,
   UserSessionState,
+  ReportPhotoType,
 } from '../../common/dao';
 import { getBotConfig } from '../../config/bot.config';
 import { ReportsService } from '../reports/reports.service';
@@ -37,6 +38,7 @@ import {
   photosKeyboard,
   rejectionReasonKeyboard,
 } from './telegram-keyboards';
+import { sendReportPhotoWithFallback } from './telegram-photo-sender';
 
 const rejectionReasons: Record<string, string> = {
   info: 'Недостаточно информации',
@@ -176,6 +178,21 @@ export class TelegramUpdateService {
       return;
     }
 
+    if (session?.state === UserSessionState.WaitingCompletionPhotos) {
+      if (text === t(user.language, 'next')) {
+        await this.finishCompletionPhotos(ctx, user, session);
+        return;
+      }
+
+      await ctx.reply(
+        'Отправьте фото выполненной работы или нажмите "Далее".',
+        {
+          reply_markup: photosKeyboard(user.language),
+        },
+      );
+      return;
+    }
+
     if (session?.state === UserSessionState.WaitingLocation) {
       if (text === t(user.language, 'enterAddress')) {
         await this.setSession(
@@ -266,9 +283,13 @@ export class TelegramUpdateService {
     const user = await this.ensureUser(ctx);
     const session = await this.getSession(user.id);
 
+    if (!session?.currentReportId) {
+      return;
+    }
+
     if (
-      session?.state !== UserSessionState.WaitingPhotos ||
-      !session.currentReportId
+      session.state !== UserSessionState.WaitingPhotos &&
+      session.state !== UserSessionState.WaitingCompletionPhotos
     ) {
       return;
     }
@@ -281,32 +302,28 @@ export class TelegramUpdateService {
     }
 
     try {
-      const file = await ctx.api.getFile(photo.file_id);
-      const body = await this.downloadTelegramFile(file.file_path);
-      const key = this.buildR2Key(
-        session.currentReportId,
-        photo.file_unique_id,
-      );
-      const uploaded = await this.storageService.upload({
-        key,
-        body,
-        contentType: 'image/jpeg',
-      });
-
-      await this.reportsService.addPhoto({
+      const photoType =
+        session.state === UserSessionState.WaitingCompletionPhotos
+          ? ReportPhotoType.AdminCompletion
+          : ReportPhotoType.UserReport;
+      await this.saveTelegramPhoto({
+        ctx,
         reportId: session.currentReportId,
         telegramFileId: photo.file_id,
         telegramFileUniqueId: photo.file_unique_id,
-        r2Bucket: uploaded.bucket,
-        r2Key: uploaded.key,
-        r2Url: uploaded.url,
-        mimeType: 'image/jpeg',
-        sizeBytes: photo.file_size || body.length,
+        fileSize: photo.file_size,
+        photoType,
+        uploadedByUserId: user.id,
       });
 
-      await ctx.reply(t(user.language, 'photoAdded'), {
-        reply_markup: photosKeyboard(user.language),
-      });
+      await ctx.reply(
+        photoType === ReportPhotoType.AdminCompletion
+          ? 'Фото выполненной работы добавлено. Отправьте ещё фото или нажмите "Далее".'
+          : t(user.language, 'photoAdded'),
+        {
+          reply_markup: photosKeyboard(user.language),
+        },
+      );
     } catch (error) {
       if (error instanceof BadRequestException) {
         await ctx.reply(t(user.language, 'tooManyPhotos'));
@@ -346,6 +363,34 @@ export class TelegramUpdateService {
     await ctx.reply(t(user.language, 'sendLocation'), {
       reply_markup: locationKeyboard(user.language),
     });
+  }
+
+  private async finishCompletionPhotos(
+    ctx: Context,
+    user: UserDao,
+    session: UserSessionDao,
+  ) {
+    if (!session.currentReportId) {
+      return;
+    }
+
+    const photoCount = await this.reportsService.countCompletionPhotos(
+      session.currentReportId,
+    );
+
+    if (photoCount < 1) {
+      await ctx.reply(
+        'Сначала отправьте хотя бы одно фото выполненной работы.',
+      );
+      return;
+    }
+
+    await this.askAdminComment(
+      ctx,
+      user,
+      session.currentReportId,
+      ReportStatus.Resolved,
+    );
   }
 
   private async handleLocation(ctx: Context) {
@@ -491,8 +536,13 @@ export class TelegramUpdateService {
       return;
     }
 
-    for (const photo of report.photos || []) {
-      await ctx.api.sendPhoto(this.config.adminChatId, photo.telegramFileId);
+    for (const photo of this.getUserReportPhotos(report)) {
+      await sendReportPhotoWithFallback(
+        ctx.api,
+        this.config.adminChatId,
+        photo,
+        this.storageService,
+      );
     }
 
     const message = await ctx.api.sendMessage(
@@ -553,8 +603,8 @@ export class TelegramUpdateService {
     const reasonCode = action === 'reject' ? third : undefined;
 
     if (action === 'resolve') {
-      await this.askAdminComment(ctx, user, reportId, ReportStatus.Resolved);
-      await ctx.answerCallbackQuery({ text: 'Введите комментарий в личке' });
+      await this.askCompletionPhotos(ctx, user, reportId);
+      await ctx.answerCallbackQuery({ text: 'Отправьте фото в личке' });
       return;
     }
 
@@ -667,8 +717,13 @@ export class TelegramUpdateService {
       Awaited<ReturnType<ReportsService['findReportWithDetails']>>
     >,
   ) {
-    for (const photo of report.photos || []) {
-      await ctx.api.sendPhoto(chatId, photo.telegramFileId);
+    for (const photo of this.getUserReportPhotos(report)) {
+      await sendReportPhotoWithFallback(
+        ctx.api,
+        chatId,
+        photo,
+        this.storageService,
+      );
     }
 
     await ctx.api.sendMessage(chatId, this.formatAdminMessage(report), {
@@ -701,6 +756,38 @@ export class TelegramUpdateService {
 
     if (user.telegramId) {
       await ctx.api.sendMessage(user.telegramId, prompt);
+    }
+  }
+
+  private async askCompletionPhotos(
+    ctx: Context,
+    user: UserDao,
+    reportId: string,
+  ) {
+    await this.setSession(
+      user.id,
+      UserSessionState.WaitingCompletionPhotos,
+      reportId,
+      {
+        reportId,
+        targetStatus: ReportStatus.Resolved,
+      },
+    );
+
+    const prompt =
+      'Отправьте 1-5 фото выполненной работы. После фото нажмите "Далее".';
+
+    if (ctx.chat?.type === 'private') {
+      await ctx.reply(prompt, {
+        reply_markup: photosKeyboard(user.language),
+      });
+      return;
+    }
+
+    if (user.telegramId) {
+      await ctx.api.sendMessage(user.telegramId, prompt, {
+        reply_markup: photosKeyboard(user.language),
+      });
     }
   }
 
@@ -816,7 +903,8 @@ export class TelegramUpdateService {
       reportNumber: report.reportNumber,
       createdAt: report.createdAt,
       status: report.status,
-      photoCount: report.photos?.length || 0,
+      photoCount: this.getUserReportPhotos(report).length,
+      completionPhotoCount: this.getCompletionPhotos(report).length,
       author: {
         fullName: report.author.fullName || '-',
         phone: report.author.phone || '-',
@@ -852,6 +940,17 @@ export class TelegramUpdateService {
         report.adminComment,
       ),
     );
+
+    if (report.status === ReportStatus.Resolved) {
+      for (const photo of this.getCompletionPhotos(report)) {
+        await sendReportPhotoWithFallback(
+          ctx.api,
+          report.author.telegramId,
+          photo,
+          this.storageService,
+        );
+      }
+    }
   }
 
   private async showMyReports(ctx: Context) {
@@ -990,6 +1089,8 @@ export class TelegramUpdateService {
         'Выберите действие на клавиатуре.',
       [UserSessionState.WaitingAdminComment]:
         'Введите комментарий администратора текстом.',
+      [UserSessionState.WaitingCompletionPhotos]:
+        'Отправьте фото выполненной работы или нажмите "Далее".',
     };
 
     await ctx.reply(
@@ -1068,6 +1169,62 @@ export class TelegramUpdateService {
     const day = String(now.getDate()).padStart(2, '0');
 
     return `reports/${year}/${month}/${day}/report-${reportId}/${photoId}.jpg`;
+  }
+
+  private async saveTelegramPhoto(input: {
+    ctx: Context;
+    reportId: string;
+    telegramFileId: string;
+    telegramFileUniqueId?: string | null;
+    fileSize?: number;
+    photoType: ReportPhotoType;
+    uploadedByUserId: string;
+  }) {
+    const file = await input.ctx.api.getFile(input.telegramFileId);
+    const body = await this.downloadTelegramFile(file.file_path);
+    const key = this.buildR2Key(
+      input.reportId,
+      `${input.photoType.toLowerCase()}-${input.telegramFileUniqueId || input.telegramFileId}`,
+    );
+    const uploaded = await this.storageService.upload({
+      key,
+      body,
+      contentType: 'image/jpeg',
+    });
+
+    return this.reportsService.addPhoto({
+      reportId: input.reportId,
+      telegramFileId: input.telegramFileId,
+      telegramFileUniqueId: input.telegramFileUniqueId,
+      r2Bucket: uploaded.bucket,
+      r2Key: uploaded.key,
+      r2Url: uploaded.url,
+      mimeType: 'image/jpeg',
+      sizeBytes: input.fileSize || body.length,
+      photoType: input.photoType,
+      uploadedByUserId: input.uploadedByUserId,
+    });
+  }
+
+  private getUserReportPhotos(
+    report: NonNullable<
+      Awaited<ReturnType<ReportsService['findReportWithDetails']>>
+    >,
+  ) {
+    return (report.photos || []).filter(
+      (photo) =>
+        !photo.photoType || photo.photoType === ReportPhotoType.UserReport,
+    );
+  }
+
+  private getCompletionPhotos(
+    report: NonNullable<
+      Awaited<ReturnType<ReportsService['findReportWithDetails']>>
+    >,
+  ) {
+    return (report.photos || []).filter(
+      (photo) => photo.photoType === ReportPhotoType.AdminCompletion,
+    );
   }
 
   private async downloadTelegramFile(filePath?: string) {

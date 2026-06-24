@@ -1,7 +1,7 @@
 import { BadRequestException } from '@nestjs/common';
 import { Repository } from 'typeorm';
 
-import { ReportDao, UserDao } from '../../common/dao';
+import { ReportDao, ReportPhotoType, UserDao } from '../../common/dao';
 import { ReportStatus } from './domain/report-status';
 import { ReportsService } from './reports.service';
 
@@ -29,6 +29,7 @@ describe('ReportsService admin improvements', () => {
     return {
       service,
       reportsRepository,
+      photosRepository,
       historyRepository,
     };
   };
@@ -97,6 +98,78 @@ describe('ReportsService admin improvements', () => {
         comment: 'Убрано.',
       }),
     );
+  });
+
+  it('stores completion photos separately from user report photos', async () => {
+    const { service, photosRepository } = createService();
+    photosRepository.count.mockResolvedValueOnce(0);
+
+    await service.addPhoto({
+      reportId: 'report-id',
+      telegramFileId: 'telegram-file-id',
+      r2Bucket: 'bucket',
+      r2Key: 'reports/report-id/completion.jpg',
+      photoType: ReportPhotoType.AdminCompletion,
+      uploadedByUserId: 'admin-id',
+    });
+
+    expect(photosRepository.save).toHaveBeenCalledWith(
+      expect.objectContaining({
+        photoType: ReportPhotoType.AdminCompletion,
+        uploadedByUserId: 'admin-id',
+      }),
+    );
+  });
+
+  it('filters user report photos by type', async () => {
+    const { service, photosRepository } = createService();
+    photosRepository.find.mockResolvedValueOnce([]);
+
+    await service.getReportUserPhotos('report-id');
+
+    expect(photosRepository.find).toHaveBeenCalledWith({
+      where: {
+        reportId: 'report-id',
+        photoType: ReportPhotoType.UserReport,
+      },
+      order: { createdAt: 'ASC' },
+    });
+  });
+
+  it('filters completion photos by type', async () => {
+    const { service, photosRepository } = createService();
+    photosRepository.find.mockResolvedValueOnce([]);
+
+    await service.getReportCompletionPhotos('report-id');
+
+    expect(photosRepository.find).toHaveBeenCalledWith({
+      where: {
+        reportId: 'report-id',
+        photoType: ReportPhotoType.AdminCompletion,
+      },
+      order: { createdAt: 'ASC' },
+    });
+  });
+
+  it('requires completion photos before resolving reports', async () => {
+    const { service, reportsRepository, photosRepository } = createService();
+    reportsRepository.findOne.mockResolvedValue({
+      id: 'report-id',
+      status: ReportStatus.InProgress,
+      assignedAdminId: 'admin-id',
+      author: { id: 'author-id' },
+      photos: [],
+    });
+    photosRepository.count.mockResolvedValueOnce(0);
+
+    await expect(
+      service.changeStatus({
+        reportId: 'report-id',
+        status: ReportStatus.Resolved,
+        admin: { id: 'admin-id' } as UserDao,
+        adminComment: 'Убрано.',
+      }),
+    ).rejects.toThrow(BadRequestException);
   });
 
   it('rejects stale admin status actions', async () => {
