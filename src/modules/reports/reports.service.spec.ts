@@ -1,5 +1,5 @@
 import { BadRequestException } from '@nestjs/common';
-import { Repository } from 'typeorm';
+import { FindOperator, Repository } from 'typeorm';
 
 import { ReportDao, ReportPhotoType, UserDao } from '../../common/dao';
 import { ReportStatus } from './domain/report-status';
@@ -8,6 +8,7 @@ import { ReportsService } from './reports.service';
 const createRepositoryMock = () => ({
   count: jest.fn(),
   create: jest.fn((value) => value),
+  createQueryBuilder: jest.fn(),
   find: jest.fn(),
   findOne: jest.fn(),
   findOneBy: jest.fn(),
@@ -16,6 +17,21 @@ const createRepositoryMock = () => ({
 });
 
 describe('ReportsService admin improvements', () => {
+  const createStatsQueryBuilderMock = (
+    rows: { status: ReportStatus; count: string }[],
+  ) => {
+    const queryBuilder = {
+      select: jest.fn().mockReturnThis(),
+      addSelect: jest.fn().mockReturnThis(),
+      where: jest.fn().mockReturnThis(),
+      andWhere: jest.fn().mockReturnThis(),
+      groupBy: jest.fn().mockReturnThis(),
+      getRawMany: jest.fn().mockResolvedValue(rows),
+    };
+
+    return queryBuilder;
+  };
+
   const createService = () => {
     const reportsRepository = createRepositoryMock();
     const photosRepository = createRepositoryMock();
@@ -64,6 +80,74 @@ describe('ReportsService admin improvements', () => {
           assignedAdminId: 'admin-id',
         },
       }),
+    );
+  });
+
+  it('loads admin reports by multiple statuses', async () => {
+    const { service, reportsRepository } = createService();
+    reportsRepository.find.mockResolvedValueOnce([]);
+
+    await service.listAdminReports({
+      statuses: [ReportStatus.New, ReportStatus.InProgress],
+    });
+
+    expect(reportsRepository.find).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: {
+          status: expect.any(FindOperator),
+        },
+      }),
+    );
+  });
+
+  it('loads operational statistics grouped by status and excludes drafts', async () => {
+    const { service, reportsRepository } = createService();
+    const queryBuilder = createStatsQueryBuilderMock([
+      { status: ReportStatus.New, count: '2' },
+      { status: ReportStatus.Resolved, count: '3' },
+    ]);
+    reportsRepository.createQueryBuilder.mockReturnValue(queryBuilder);
+
+    const stats = await service.getOperationalStats(
+      new Date('2026-06-26T08:00:00.000Z'),
+    );
+
+    expect(stats.allTime.total).toBe(5);
+    expect(stats.allTime.byStatus[ReportStatus.New]).toBe(2);
+    expect(queryBuilder.where).toHaveBeenCalledWith(
+      'report.status != :draftStatus',
+      { draftStatus: ReportStatus.Draft },
+    );
+    expect(queryBuilder.andWhere).toHaveBeenCalledWith(
+      'report.submittedAt IS NOT NULL',
+    );
+  });
+
+  it('applies submittedAt period filters to today and seven day stats', async () => {
+    const { service, reportsRepository } = createService();
+    const queryBuilders = [
+      createStatsQueryBuilderMock([]),
+      createStatsQueryBuilderMock([]),
+      createStatsQueryBuilderMock([]),
+    ];
+    reportsRepository.createQueryBuilder
+      .mockReturnValueOnce(queryBuilders[0])
+      .mockReturnValueOnce(queryBuilders[1])
+      .mockReturnValueOnce(queryBuilders[2]);
+
+    await service.getOperationalStats(new Date('2026-06-26T08:00:00.000Z'));
+
+    expect(queryBuilders[0].andWhere).toHaveBeenCalledWith(
+      'report.submittedAt >= :from',
+      { from: new Date('2026-06-25T19:00:00.000Z') },
+    );
+    expect(queryBuilders[0].andWhere).toHaveBeenCalledWith(
+      'report.submittedAt < :to',
+      { to: new Date('2026-06-26T19:00:00.000Z') },
+    );
+    expect(queryBuilders[1].andWhere).toHaveBeenCalledWith(
+      'report.submittedAt >= :from',
+      { from: new Date('2026-06-19T19:00:00.000Z') },
     );
   });
 

@@ -16,5 +16,6 @@ export const getBotConfig = () => {
     mode: process.env.BOT_MODE || 'polling',
     adminIds: parseList(process.env.ADMIN_IDS),
     adminChatId: process.env.ADMIN_CHAT_ID,
+    superAdminIds: parseList(process.env.SUPER_ADMIN_IDS),
   };
 };

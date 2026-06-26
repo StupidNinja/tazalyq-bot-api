@@ -1,4 +1,5 @@
 import { ReportStatus, getReportStatusLabel } from '../domain/report-status';
+import { getRejectionReasonLabel } from '../domain/rejection-reason';
 
 type AdminReportMessageInput = {
   id: string;
@@ -76,15 +77,17 @@ const formatCommentBlock = (language: 'ru' | 'kk', comment?: string | null) => {
     return [];
   }
 
-  return ['', language === 'kk' ? 'Пікір:' : 'Комментарий:', comment];
+  return ['', language === 'kk' ? 'Түсініктеме:' : 'Комментарий:', comment];
 };
 
 const formatReasonBlock = (language: 'ru' | 'kk', reason?: string | null) => {
-  if (!reason) {
+  const reasonLabel = getRejectionReasonLabel(reason, language);
+
+  if (!reasonLabel) {
     return [];
   }
 
-  return ['', language === 'kk' ? 'Себебі:' : 'Причина:', reason];
+  return ['', language === 'kk' ? 'Себебі:' : 'Причина:', reasonLabel];
 };
 
 export const formatUserStatusMessage = (

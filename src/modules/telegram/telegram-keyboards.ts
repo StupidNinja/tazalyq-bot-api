@@ -60,6 +60,9 @@ export const confirmationKeyboard = (language: BotLanguage | string | null) =>
 
 export const adminMenuKeyboard = () =>
   new InlineKeyboard()
+    .text('🟢 Активные', 'admin:list:active')
+    .text('⚪️ Неактивные', 'admin:list:inactive')
+    .row()
     .text('🆕 Новые', 'admin:list:new')
     .text('👀 В работе', 'admin:list:in_progress')
     .row()

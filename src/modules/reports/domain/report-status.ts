@@ -39,12 +39,12 @@ export const getReportStatusLabel = (
       [ReportStatus.Cancelled]: 'Отменено',
     },
     kk: {
-      [ReportStatus.Draft]: 'Жоба',
+      [ReportStatus.Draft]: 'Нобай',
       [ReportStatus.New]: 'Жаңа',
-      [ReportStatus.InProgress]: 'Жұмыста',
+      [ReportStatus.InProgress]: 'Орындалуда',
       [ReportStatus.Resolved]: 'Жабылды',
       [ReportStatus.Rejected]: 'Қабылданбады',
-      [ReportStatus.Cancelled]: 'Болдырылмады',
+      [ReportStatus.Cancelled]: 'Бас тартылды',
     },
   };
 

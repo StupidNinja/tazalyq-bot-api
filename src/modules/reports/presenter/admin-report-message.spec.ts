@@ -49,4 +49,18 @@ describe('admin report messages', () => {
       'Обращение #124 отклонено.\n\nПричина:\nНекорректное фото\n\nКомментарий:\nФото не показывает место проблемы.',
     );
   });
+
+  it('translates rejection reason codes for user notifications', () => {
+    expect(
+      formatUserStatusMessage(
+        124,
+        ReportStatus.Rejected,
+        'kk',
+        'no_address',
+        'Мекенжайды нақтылаңыз.',
+      ),
+    ).toBe(
+      'Өтініш #124 қабылданбады.\n\nСебебі:\nМекенжай табылмады\n\nТүсініктеме:\nМекенжайды нақтылаңыз.',
+    );
+  });
 });

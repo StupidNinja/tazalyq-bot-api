@@ -3,6 +3,7 @@ import { Injectable } from '@nestjs/common';
 import { Bot, GrammyError } from 'grammy';
 
 import { getBotConfig } from '../../config/bot.config';
+import { userBotCommands } from './domain/telegram-commands';
 import { TelegramUpdateService } from './telegram-update.service';
 
 @Injectable()
@@ -30,6 +31,7 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
     this.updates.register(this.bot);
 
     try {
+      await this.bot.api.setMyCommands(userBotCommands);
       await this.bot.start({
         onStart: ({ username }) =>
           this.logger.log(`Telegram bot @${username} started in polling mode`),

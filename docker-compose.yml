@@ -12,6 +12,7 @@ services:
       DB_NAME: ${DB_NAME:-postgres}
       BOT_TOKEN: ${BOT_TOKEN:-}
       BOT_MODE: ${BOT_MODE:-polling}
+      SUPER_ADMIN_IDS: ${SUPER_ADMIN_IDS:-}
       ADMIN_IDS: ${ADMIN_IDS:-}
       ADMIN_CHAT_ID: ${ADMIN_CHAT_ID:-}
       R2_ACCOUNT_ID: ${R2_ACCOUNT_ID:-}

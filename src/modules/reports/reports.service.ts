@@ -1,6 +1,6 @@
 import { BadRequestException, Injectable } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { In, Repository } from 'typeorm';
 
 import {
   ReportDao,
@@ -13,6 +13,10 @@ import {
   ReportStatus,
   canTransitionReportStatus,
 } from './domain/report-status';
+import {
+  OperationalReportStats,
+  ReportStatsPeriod,
+} from './presenter/report-stats-message';
 
 type AddPhotoInput = {
   reportId: string;
@@ -29,6 +33,7 @@ type AddPhotoInput = {
 
 type ListAdminReportsInput = {
   status?: ReportStatus;
+  statuses?: ReportStatus[];
   assignedAdminId?: string;
 };
 
@@ -38,6 +43,41 @@ type ChangeReportStatusInput = {
   admin: UserDao;
   rejectionReason?: string | null;
   adminComment?: string | null;
+};
+
+type StatsPeriodInput = {
+  from?: Date;
+  to?: Date;
+};
+
+type StatsRow = {
+  status: ReportStatus;
+  count: string;
+};
+
+const ALMATY_UTC_OFFSET_MS = 5 * 60 * 60 * 1000;
+
+const getAlmatyDateParts = (date: Date) => {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Almaty',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).formatToParts(date);
+  const getPart = (type: string) =>
+    Number(parts.find((part) => part.type === type)?.value);
+
+  return {
+    year: getPart('year'),
+    month: getPart('month'),
+    day: getPart('day'),
+  };
+};
+
+const getAlmatyDayStartUtc = (date: Date) => {
+  const { year, month, day } = getAlmatyDateParts(date);
+
+  return new Date(Date.UTC(year, month - 1, day) - ALMATY_UTC_OFFSET_MS);
 };
 
 @Injectable()
@@ -228,7 +268,11 @@ export class ReportsService {
   async listAdminReports(input: ListAdminReportsInput) {
     return this.reportsRepository.find({
       where: {
-        ...(input.status ? { status: input.status } : {}),
+        ...(input.status
+          ? { status: input.status }
+          : input.statuses?.length
+            ? { status: In(input.statuses) }
+            : {}),
         ...(input.assignedAdminId
           ? { assignedAdminId: input.assignedAdminId }
           : {}),
@@ -237,6 +281,26 @@ export class ReportsService {
       take: 10,
       relations: { author: true, assignedAdmin: true },
     });
+  }
+
+  async getOperationalStats(now = new Date()): Promise<OperationalReportStats> {
+    const todayStart = getAlmatyDayStartUtc(now);
+    const tomorrowStart = new Date(todayStart.getTime() + 24 * 60 * 60 * 1000);
+    const sevenDaysStart = new Date(
+      todayStart.getTime() - 6 * 24 * 60 * 60 * 1000,
+    );
+
+    const [today, sevenDays, allTime] = await Promise.all([
+      this.getStatsPeriod({ from: todayStart, to: tomorrowStart }),
+      this.getStatsPeriod({ from: sevenDaysStart, to: tomorrowStart }),
+      this.getStatsPeriod({}),
+    ]);
+
+    return {
+      today,
+      sevenDays,
+      allTime,
+    };
   }
 
   async getReportUserPhotos(reportId: string) {
@@ -259,6 +323,42 @@ export class ReportsService {
       },
       order: { createdAt: 'ASC' },
     });
+  }
+
+  private async getStatsPeriod(
+    input: StatsPeriodInput,
+  ): Promise<ReportStatsPeriod> {
+    const query = this.reportsRepository
+      .createQueryBuilder('report')
+      .select('report.status', 'status')
+      .addSelect('COUNT(*)', 'count')
+      .where('report.status != :draftStatus', {
+        draftStatus: ReportStatus.Draft,
+      })
+      .andWhere('report.submittedAt IS NOT NULL');
+
+    if (input.from) {
+      query.andWhere('report.submittedAt >= :from', { from: input.from });
+    }
+
+    if (input.to) {
+      query.andWhere('report.submittedAt < :to', { to: input.to });
+    }
+
+    const rows = await query.groupBy('report.status').getRawMany<StatsRow>();
+
+    const byStatus = rows.reduce<Partial<Record<ReportStatus, number>>>(
+      (acc, row) => {
+        acc[row.status] = Number(row.count);
+        return acc;
+      },
+      {},
+    );
+
+    return {
+      total: Object.values(byStatus).reduce((sum, count) => sum + count, 0),
+      byStatus,
+    };
   }
 
   private async countReportPhotos(

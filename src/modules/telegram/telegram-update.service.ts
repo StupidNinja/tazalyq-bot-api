@@ -12,19 +12,35 @@ import {
   ReportPhotoType,
 } from '../../common/dao';
 import { getBotConfig } from '../../config/bot.config';
+import { AdminService } from '../admin/admin.service';
 import { ReportsService } from '../reports/reports.service';
 import {
   ReportStatus,
   getReportStatusLabel,
 } from '../reports/domain/report-status';
 import {
+  formatAdminCommentPrompt,
+  isRejectionReasonCode,
+} from '../reports/domain/rejection-reason';
+import {
   formatAdminReportMessage,
   formatUserStatusMessage,
 } from '../reports/presenter/admin-report-message';
 import { formatAdminReportList } from '../reports/presenter/admin-report-list';
+import { formatReportStatsMessage } from '../reports/presenter/report-stats-message';
 import { R2StorageService } from '../storage/storage.service';
+import { formatAdminChatList } from './domain/admin-chat-list';
 import { t } from './domain/bot-text';
+import {
+  shouldIgnoreNonPrivateMessage,
+  shouldShowPrivateChatPrompt,
+} from './domain/chat-routing';
 import { normalizePhoneNumber } from './domain/phone-normalizer';
+import { getBotCommandsForRole } from './domain/telegram-commands';
+import {
+  isSameTelegramMessage,
+  isTelegramMessageNotModifiedError,
+} from './domain/telegram-message';
 import {
   adminStatusKeyboard,
   adminMenuKeyboard,
@@ -40,24 +56,18 @@ import {
 } from './telegram-keyboards';
 import { sendReportPhotoWithFallback } from './telegram-photo-sender';
 
-const rejectionReasons: Record<string, string> = {
-  info: 'Недостаточно информации',
-  not_garbage: 'Не относится к мусору',
-  bad_photo: 'Некорректное фото',
-  duplicate: 'Дубликат обращения',
-  no_address: 'Адрес не найден',
-};
-
 @Injectable()
 export class TelegramUpdateService {
   private readonly logger = new Logger(TelegramUpdateService.name);
   private readonly config = getBotConfig();
+  private readonly syncedCommandScopes = new Set<string>();
 
   constructor(
     @InjectRepository(UserDao)
     private readonly usersRepository: Repository<UserDao>,
     @InjectRepository(UserSessionDao)
     private readonly sessionsRepository: Repository<UserSessionDao>,
+    private readonly adminService: AdminService,
     private readonly reportsService: ReportsService,
     private readonly storageService: R2StorageService,
   ) {}
@@ -70,6 +80,12 @@ export class TelegramUpdateService {
     bot.command('help', (ctx) => this.showHelp(ctx));
     bot.command('cancel', (ctx) => this.cancel(ctx));
     bot.command('admin', (ctx) => this.showAdminMenu(ctx));
+    bot.command('admin_add', (ctx) => this.handleAdminAdd(ctx));
+    bot.command('admin_remove', (ctx) => this.handleAdminRemove(ctx));
+    bot.command('admins', (ctx) => this.handleAdmins(ctx));
+    bot.command('admin_chat_add', (ctx) => this.handleAdminChatAdd(ctx));
+    bot.command('admin_chat_remove', (ctx) => this.handleAdminChatRemove(ctx));
+    bot.command('admin_chats', (ctx) => this.handleAdminChats(ctx));
     bot.command('stats', (ctx) => this.showStats(ctx));
     bot.callbackQuery(/^lang:(ru|kk)$/, (ctx) => this.handleLanguage(ctx));
     bot.callbackQuery(/^admin:/, (ctx) => this.handleAdminCallback(ctx));
@@ -83,6 +99,10 @@ export class TelegramUpdateService {
   }
 
   private async handleStart(ctx: Context) {
+    if (await this.promptPrivateChatForUserCommand(ctx)) {
+      return;
+    }
+
     await this.ensureUser(ctx);
     await ctx.reply(t(null, 'chooseLanguage'), {
       reply_markup: languageKeyboard(),
@@ -90,6 +110,10 @@ export class TelegramUpdateService {
   }
 
   private async showLanguage(ctx: Context) {
+    if (await this.promptPrivateChatForUserCommand(ctx)) {
+      return;
+    }
+
     await this.ensureUser(ctx);
     await ctx.reply(t(null, 'chooseLanguage'), {
       reply_markup: languageKeyboard(),
@@ -104,6 +128,7 @@ export class TelegramUpdateService {
 
     user.language = language;
     await this.usersRepository.save(user);
+    await this.syncPrivateChatCommands(ctx, user);
 
     if (!user.fullName) {
       await this.setSession(user.id, UserSessionState.WaitingFullName);
@@ -122,6 +147,10 @@ export class TelegramUpdateService {
   }
 
   private async handleText(ctx: Context) {
+    if (this.shouldIgnoreNonPrivateUserMessage(ctx)) {
+      return;
+    }
+
     const user = await this.ensureUser(ctx);
     const text = ctx.message?.text?.trim() || '';
     const session = await this.getSession(user.id);
@@ -260,6 +289,10 @@ export class TelegramUpdateService {
   }
 
   private async handleContact(ctx: Context) {
+    if (this.shouldIgnoreNonPrivateUserMessage(ctx)) {
+      return;
+    }
+
     const user = await this.ensureUser(ctx);
     const phone = ctx.message?.contact?.phone_number;
 
@@ -271,6 +304,10 @@ export class TelegramUpdateService {
   }
 
   private async startReport(ctx: Context) {
+    if (await this.promptPrivateChatForUserCommand(ctx)) {
+      return;
+    }
+
     const user = await this.ensureRegisteredUser(ctx);
     const report = await this.reportsService.createDraft(user);
     await this.setSession(user.id, UserSessionState.WaitingPhotos, report.id);
@@ -280,6 +317,10 @@ export class TelegramUpdateService {
   }
 
   private async handlePhoto(ctx: Context) {
+    if (this.shouldIgnoreNonPrivateUserMessage(ctx)) {
+      return;
+    }
+
     const user = await this.ensureUser(ctx);
     const session = await this.getSession(user.id);
 
@@ -394,6 +435,10 @@ export class TelegramUpdateService {
   }
 
   private async handleLocation(ctx: Context) {
+    if (this.shouldIgnoreNonPrivateUserMessage(ctx)) {
+      return;
+    }
+
     const user = await this.ensureUser(ctx);
     const session = await this.getSession(user.id);
     const location = ctx.message?.location;
@@ -532,28 +577,37 @@ export class TelegramUpdateService {
       Awaited<ReturnType<ReportsService['findReportWithDetails']>>
     >,
   ) {
-    if (!this.config.adminChatId) {
+    const adminChatIds = await this.getAdminChatIds();
+
+    if (!adminChatIds.length) {
       return;
     }
 
-    for (const photo of this.getUserReportPhotos(report)) {
-      await sendReportPhotoWithFallback(
-        ctx.api,
-        this.config.adminChatId,
-        photo,
-        this.storageService,
+    for (const chatId of adminChatIds) {
+      for (const photo of this.getUserReportPhotos(report)) {
+        await sendReportPhotoWithFallback(
+          ctx.api,
+          chatId,
+          photo,
+          this.storageService,
+        );
+      }
+
+      const message = await ctx.api.sendMessage(
+        chatId,
+        this.formatAdminMessage(report),
+        {
+          reply_markup: adminStatusKeyboard(report.id, report.status),
+        },
       );
+
+      if (chatId === adminChatIds[0]) {
+        await this.reportsService.saveAdminMessageId(
+          report.id,
+          message.message_id,
+        );
+      }
     }
-
-    const message = await ctx.api.sendMessage(
-      this.config.adminChatId,
-      this.formatAdminMessage(report),
-      {
-        reply_markup: adminStatusKeyboard(report.id, report.status),
-      },
-    );
-
-    await this.reportsService.saveAdminMessageId(report.id, message.message_id);
   }
 
   private async handleAdminCallback(ctx: Context) {
@@ -609,12 +663,17 @@ export class TelegramUpdateService {
     }
 
     if (action === 'reject') {
+      if (reasonCode && !isRejectionReasonCode(reasonCode)) {
+        await ctx.answerCallbackQuery({ text: 'Причина не найдена' });
+        return;
+      }
+
       await this.askAdminComment(
         ctx,
         user,
         reportId,
         ReportStatus.Rejected,
-        reasonCode ? rejectionReasons[reasonCode] : undefined,
+        reasonCode,
       );
       await ctx.answerCallbackQuery({ text: 'Введите комментарий в личке' });
       return;
@@ -626,7 +685,8 @@ export class TelegramUpdateService {
         : action === 'resolve'
           ? ReportStatus.Resolved
           : ReportStatus.Rejected;
-    const reason = reasonCode ? rejectionReasons[reasonCode] : undefined;
+    const reason =
+      reasonCode && isRejectionReasonCode(reasonCode) ? reasonCode : undefined;
     const report = await this.applyAdminStatusChange(ctx, {
       reportId,
       status,
@@ -668,19 +728,33 @@ export class TelegramUpdateService {
     const input =
       listType === 'mine'
         ? { status: ReportStatus.InProgress, assignedAdminId: user.id }
-        : {
-            status:
-              listType === 'in_progress'
-                ? ReportStatus.InProgress
-                : ReportStatus.New,
-          };
+        : listType === 'active'
+          ? { statuses: [ReportStatus.New, ReportStatus.InProgress] }
+          : listType === 'inactive'
+            ? {
+                statuses: [
+                  ReportStatus.Resolved,
+                  ReportStatus.Rejected,
+                  ReportStatus.Cancelled,
+                ],
+              }
+            : {
+                status:
+                  listType === 'in_progress'
+                    ? ReportStatus.InProgress
+                    : ReportStatus.New,
+              };
     const reports = await this.reportsService.listAdminReports(input);
     const title =
       listType === 'mine'
         ? 'Мои обращения в работе'
-        : listType === 'in_progress'
-          ? 'Обращения в работе'
-          : 'Новые обращения';
+        : listType === 'active'
+          ? 'Активные обращения'
+          : listType === 'inactive'
+            ? 'Неактивные обращения'
+            : listType === 'in_progress'
+              ? 'Обращения в работе'
+              : 'Новые обращения';
 
     await ctx.reply(formatAdminReportList(title, reports), {
       reply_markup: adminReportListKeyboard(reports),
@@ -744,10 +818,11 @@ export class TelegramUpdateService {
       rejectionReason,
     });
 
-    const prompt =
-      status === ReportStatus.Resolved
-        ? 'Введите комментарий для закрытия обращения. Он будет отправлен пользователю.'
-        : `Введите комментарий для отклонения обращения.\nПричина: ${rejectionReason || '-'}`;
+    const prompt = formatAdminCommentPrompt(
+      status,
+      user.language,
+      rejectionReason,
+    );
 
     if (ctx.chat?.type === 'private') {
       await ctx.reply(prompt);
@@ -868,14 +943,22 @@ export class TelegramUpdateService {
       return;
     }
 
-    await ctx.api.editMessageText(
-      this.config.adminChatId,
-      report.adminMessageId,
-      this.formatAdminMessage(report),
-      {
-        reply_markup: adminStatusKeyboard(report.id, report.status),
-      },
-    );
+    try {
+      await ctx.api.editMessageText(
+        this.config.adminChatId,
+        report.adminMessageId,
+        this.formatAdminMessage(report),
+        {
+          reply_markup: adminStatusKeyboard(report.id, report.status),
+        },
+      );
+    } catch (error) {
+      if (isTelegramMessageNotModifiedError(error)) {
+        return;
+      }
+
+      throw error;
+    }
   }
 
   private async editCurrentAdminMessage(
@@ -884,11 +967,28 @@ export class TelegramUpdateService {
       Awaited<ReturnType<ReportsService['findReportWithDetails']>>
     >,
   ) {
+    const callbackMessage = ctx.callbackQuery?.message;
+
+    if (
+      isSameTelegramMessage(
+        callbackMessage?.chat.id,
+        callbackMessage?.message_id,
+        this.config.adminChatId,
+        report.adminMessageId,
+      )
+    ) {
+      return;
+    }
+
     try {
       await ctx.editMessageText(this.formatAdminMessage(report), {
         reply_markup: adminStatusKeyboard(report.id, report.status),
       });
     } catch (error) {
+      if (isTelegramMessageNotModifiedError(error)) {
+        return;
+      }
+
       this.logger.warn(error);
     }
   }
@@ -954,6 +1054,10 @@ export class TelegramUpdateService {
   }
 
   private async showMyReports(ctx: Context) {
+    if (await this.promptPrivateChatForUserCommand(ctx)) {
+      return;
+    }
+
     const user = await this.ensureRegisteredUser(ctx);
     const reports = await this.reportsService.listUserReports(user.id);
 
@@ -980,6 +1084,10 @@ export class TelegramUpdateService {
   }
 
   private async showHelp(ctx: Context) {
+    if (await this.promptPrivateChatForUserCommand(ctx)) {
+      return;
+    }
+
     const user = await this.ensureUser(ctx);
     await ctx.reply(t(user.language, 'help'), {
       reply_markup: mainMenuKeyboard(user.language),
@@ -994,10 +1102,163 @@ export class TelegramUpdateService {
       return;
     }
 
-    await ctx.reply('/stats будет расширен после базового MVP.');
+    const stats = await this.reportsService.getOperationalStats();
+
+    await ctx.reply(formatReportStatsMessage(stats));
+  }
+
+  private async handleAdminAdd(ctx: Context) {
+    const user = await this.ensureUser(ctx);
+
+    if (!(await this.ensureSuperAdmin(ctx, user))) {
+      return;
+    }
+
+    const identifier = this.getCommandArgument(ctx);
+
+    if (!identifier) {
+      await ctx.reply('Использование: /admin_add @username');
+      return;
+    }
+
+    const result = await this.adminService.addAdmin(user, identifier);
+
+    if (result.status === 'pending') {
+      await ctx.reply(
+        `Приглашение для @${result.username} создано.\nПопросите пользователя открыть бота и нажать /start.`,
+      );
+      return;
+    }
+
+    await ctx.reply(
+      `Админ ${result.user.username ? `@${result.user.username}` : result.user.telegramId} добавлен.`,
+    );
+  }
+
+  private async handleAdminRemove(ctx: Context) {
+    const user = await this.ensureUser(ctx);
+
+    if (!(await this.ensureSuperAdmin(ctx, user))) {
+      return;
+    }
+
+    const identifier = this.getCommandArgument(ctx);
+
+    if (!identifier) {
+      await ctx.reply('Использование: /admin_remove @username');
+      return;
+    }
+
+    const result = await this.adminService.removeAdmin(user, identifier);
+
+    if (result.status === 'removed') {
+      await ctx.reply(
+        `Админ ${result.user.username ? `@${result.user.username}` : result.user.telegramId} удалён.`,
+      );
+      return;
+    }
+
+    if (result.status === 'pending_removed') {
+      await ctx.reply(`Pending-приглашение для @${result.username} удалено.`);
+      return;
+    }
+
+    await ctx.reply('Админ или pending-приглашение не найдены.');
+  }
+
+  private async handleAdmins(ctx: Context) {
+    const user = await this.ensureUser(ctx);
+
+    if (!(await this.ensureSuperAdmin(ctx, user))) {
+      return;
+    }
+
+    const admins = await this.adminService.listAdmins();
+    const pendingInvites = await this.adminService.listPendingAdminInvites();
+
+    await ctx.reply(
+      [
+        'Админы:',
+        '',
+        ...(admins.length
+          ? admins.map(
+              (admin) =>
+                `${admin.role}: ${admin.telegramId || '-'} ${admin.fullName || (admin.username ? `@${admin.username}` : '')}`,
+            )
+          : ['Активных админов нет.']),
+        '',
+        'Ожидают входа:',
+        ...(pendingInvites.length
+          ? pendingInvites.map((invite) => `@${invite.username}`)
+          : ['Нет pending-приглашений.']),
+      ].join('\n'),
+    );
+  }
+
+  private async handleAdminChatAdd(ctx: Context) {
+    const user = await this.ensureUser(ctx);
+
+    if (!(await this.ensureSuperAdmin(ctx, user))) {
+      return;
+    }
+
+    const chat = ctx.chat;
+
+    if (!chat || chat.type === 'private') {
+      await ctx.reply(
+        'Добавьте бота в нужную группу и отправьте /admin_chat_add прямо в этой группе. Так бот сам определит chat_id.',
+      );
+      return;
+    }
+
+    await this.adminService.addAdminChat(user, {
+      telegramChatId: String(chat.id),
+      title: 'title' in chat ? chat.title : null,
+      type: chat.type,
+    });
+    await ctx.reply('Этот чат добавлен как админский.');
+  }
+
+  private async handleAdminChatRemove(ctx: Context) {
+    const user = await this.ensureUser(ctx);
+
+    if (!(await this.ensureSuperAdmin(ctx, user))) {
+      return;
+    }
+
+    const commandArgument = this.getCommandArgument(ctx);
+    const telegramChatId =
+      commandArgument ||
+      (ctx.chat && ctx.chat.type !== 'private' ? String(ctx.chat.id) : null);
+
+    if (!telegramChatId) {
+      await ctx.reply(
+        'Использование: /admin_chat_remove <chat_id>\nИли отправьте команду в админском групповом чате.',
+      );
+      return;
+    }
+
+    await this.adminService.disableAdminChat(user, telegramChatId);
+    await ctx.reply(`Админский чат ${telegramChatId} отключён.`);
+  }
+
+  private async handleAdminChats(ctx: Context) {
+    const user = await this.ensureUser(ctx);
+
+    if (!(await this.ensureSuperAdmin(ctx, user))) {
+      return;
+    }
+
+    const chats = await this.adminService.listActiveAdminChats();
+
+    await ctx.reply(formatAdminChatList(chats, this.config.adminChatId));
   }
 
   private async cancel(ctx: Context) {
+    if (await this.promptPrivateChatForUserCommand(ctx)) {
+      return;
+    }
+
     const user = await this.ensureUser(ctx);
     const session = await this.getSession(user.id);
 
@@ -1115,20 +1376,31 @@ export class TelegramUpdateService {
         firstName: from.first_name || null,
         lastName: from.last_name || null,
         language: UserLanguage.Ru,
-        role: this.config.adminIds.includes(telegramId)
-          ? UserRole.Admin
-          : UserRole.User,
+        role: this.getBootstrapRole(telegramId),
       });
     } else {
       user.username = from.username || user.username;
       user.firstName = from.first_name || user.firstName;
       user.lastName = from.last_name || user.lastName;
-      user.role = this.config.adminIds.includes(telegramId)
-        ? UserRole.Admin
-        : user.role;
+      user.role =
+        this.getBootstrapRole(telegramId) === UserRole.SuperAdmin
+          ? UserRole.SuperAdmin
+          : this.config.adminIds.includes(telegramId)
+            ? UserRole.Admin
+            : user.role;
     }
 
-    return this.usersRepository.save(user);
+    const savedUser = await this.usersRepository.save(user);
+    const adminInviteActivated =
+      await this.adminService.activatePendingAdminInvite(savedUser);
+
+    if (adminInviteActivated && ctx.chat?.type === 'private') {
+      await ctx.reply('Вам выдан доступ админа.');
+    }
+
+    await this.syncPrivateChatCommands(ctx, savedUser);
+
+    return savedUser;
   }
 
   private async getSession(userId: string) {
@@ -1160,6 +1432,84 @@ export class TelegramUpdateService {
 
   private isAdmin(user: UserDao) {
     return [UserRole.Admin, UserRole.SuperAdmin].includes(user.role);
+  }
+
+  private shouldIgnoreNonPrivateUserMessage(ctx: Context) {
+    return shouldIgnoreNonPrivateMessage(ctx.chat?.type);
+  }
+
+  private async promptPrivateChatForUserCommand(ctx: Context) {
+    if (!shouldShowPrivateChatPrompt(ctx.chat?.type)) {
+      return false;
+    }
+
+    await ctx.reply('Для создания обращений откройте бота в личке.');
+    return true;
+  }
+
+  private async ensureSuperAdmin(ctx: Context, user: UserDao) {
+    if (user.role === UserRole.SuperAdmin) {
+      return true;
+    }
+
+    await ctx.reply('Эта команда доступна только SUPER_ADMIN.');
+    return false;
+  }
+
+  private async syncPrivateChatCommands(ctx: Context, user: UserDao) {
+    if (ctx.chat?.type !== 'private') {
+      return;
+    }
+
+    const scopeKey = `${ctx.chat.id}:${user.role}:${user.language}`;
+
+    if (this.syncedCommandScopes.has(scopeKey)) {
+      return;
+    }
+
+    try {
+      await ctx.api.setMyCommands(
+        getBotCommandsForRole(user.role, user.language),
+        {
+          scope: {
+            type: 'chat',
+            chat_id: ctx.chat.id,
+          },
+        },
+      );
+      this.syncedCommandScopes.add(scopeKey);
+    } catch (error) {
+      this.logger.warn(error);
+    }
+  }
+
+  private getBootstrapRole(telegramId: string) {
+    if (this.config.superAdminIds.includes(telegramId)) {
+      return UserRole.SuperAdmin;
+    }
+
+    if (this.config.adminIds.includes(telegramId)) {
+      return UserRole.Admin;
+    }
+
+    return UserRole.User;
+  }
+
+  private async getAdminChatIds() {
+    const chats = await this.adminService.listActiveAdminChats();
+    const chatIds = chats.map((chat) => chat.telegramChatId);
+
+    if (!chatIds.length && this.config.adminChatId) {
+      return [this.config.adminChatId];
+    }
+
+    return chatIds;
+  }
+
+  private getCommandArgument(ctx: Context) {
+    const text = ctx.message && 'text' in ctx.message ? ctx.message.text : '';
+
+    return text.split(/\s+/).slice(1).join(' ').trim();
   }
 
   private buildR2Key(reportId: string, photoId: string) {
